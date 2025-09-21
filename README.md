@@ -22,6 +22,8 @@ To run the notebooks, please follow these steps:
 
 The repository includes five distinct notebooks, each designed to test a specific input modality or a unique model configuration:
 
+* **data_acquisition_script**: This folder contains the `data_acquisition.py`, a Python script built on Playwright for collecting and preprocessing website data.
+
 * **Multimodales_Pipeline.ipynb**: This notebook is designed for a full multimodal analysis. It processes the URL, HTML content, and a screenshot of a website to determine if it is a phishing threat. This notebook includes all models from the benchmark, but the `phi3.5` model will encounter an error due to its specific `chat_template` requirements.
 
 * **Multimodales_Pipeline_HTML.ipynb**: This notebook focuses on HTML-only analysis. It processes only the HTML content of a website.
