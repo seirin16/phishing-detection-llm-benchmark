@@ -1,0 +1,297 @@
+from playwright.sync_api import sync_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import threading
+import tkinter as tk
+from tkinter import filedialog
+
+# Configuration
+DEFAULT_TXT_FILE = "url.txt"  # Default URL file
+output_dir = "output"  # Main output directory
+os.makedirs(output_dir, exist_ok=True)
+
+# Lock for safe I/O between threads (primarily for print)
+print_lock = threading.Lock()
+
+# --- Timeout Constants ---
+# Global timeout for the complete processing of a URL within a thread.
+# If extract_page_data takes longer than this, the future.result() in main will raise a TimeoutError.
+GLOBAL_PROCESS_TIMEOUT_PER_URL = 90  # seconds
+
+# Timeout for individual Playwright operations (goto, screenshot, content).
+# Must be less than GLOBAL_PROCESS_TIMEOUT_PER_URL to allow internal Playwright timeouts to act first.
+PLAYWRIGHT_OPERATION_TIMEOUT_MS = (GLOBAL_PROCESS_TIMEOUT_PER_URL - 10) * 1000  # milliseconds (e.g., 80000 ms if GLOBAL is 90s)
+
+
+def sanitize_folder_name(url):
+    """Converts a URL into a safe and short folder name."""
+    clean_url = re.sub(r'^https?://(www\.)?', '', url)
+    clean_url = re.sub(r'/$', '', clean_url)
+    clean_url = re.sub(r'[^\w\-_.]', '_', clean_url)[:50]  # Limits length
+    clean_url = clean_url.strip('-_.')
+    if not clean_url:
+        return "unknown_url"
+    return clean_url
+
+
+def extract_page_data(args, playwright_op_timeout_ms):
+    """
+    Processes a URL: navigates, takes a screenshot, extracts HTML, and saves metadata.
+    Handles internal timeouts for Playwright operations.
+    """
+    url, label, url_count = args
+    playwright_instance = None
+    browser = None
+    context = None
+    page = None
+    page_instance_created = False  # Flag to check if 'page' instance was created
+
+    # 1. Create folder name and the folder immediately
+    safe_name = sanitize_folder_name(url)
+    folder_name = f"{url_count + 1:05d}_{safe_name}"  # Format 00001_name, etc.
+    subfolder_path = os.path.join(output_dir, folder_name)
+    os.makedirs(subfolder_path, exist_ok=True)  # Ensures creation
+
+    # 2. Prepare processed URL for metadata and navigation
+    processed_url = url.strip()
+    if not processed_url:
+        initial_status = "Error - Empty URL"
+        processed_url_for_metadata = "EMPTY_OR_INVALID_URL"
+    elif not processed_url.startswith(('http://', 'https://')):
+        processed_url_for_metadata = f'https://{processed_url}'  # Assume https for metadata
+    else:
+        processed_url_for_metadata = processed_url
+
+    if 'initial_status' not in locals():  # If not an empty URL
+        initial_status = "Pending"
+
+    # 3. Write initial metadata.txt
+    metadata_filepath = os.path.join(subfolder_path, "metadata.txt")
+    error_log_filepath = os.path.join(subfolder_path, "error.log")
+
+    def log_error_to_file(error_type, message):
+        try:
+            with open(error_log_filepath, "a", encoding="utf-8") as f:
+                f.write(f"\n--- {error_type} ---\nURL: {url}\nMessage: {message}\n")
+        except Exception as log_write_error:
+            with print_lock:
+                print(f"[{url_count+1}] CRITICAL: Failed to write to error.log for {url}: {log_write_error}")
+
+    try:
+        with open(metadata_filepath, "w", encoding="utf-8") as f:
+            f.write(f"Original URL: {url}\nProcessed URL: {processed_url_for_metadata}\nLabel: {label}\nStatus: {initial_status}")
+    except Exception as meta_init_error:
+        with print_lock:
+            print(f"[{url_count+1}] ⚠️ Initial error writing metadata for {url}: {meta_init_error}")
+        log_error_to_file("Metadata Init Error", str(meta_init_error))
+
+    if initial_status.startswith("Error"):  # Do not continue if the URL is invalid from the start
+        return
+
+    # 4. Playwright Processing
+    current_operation_status = "Starting Playwright"
+    try:
+        playwright_instance = sync_playwright().start()
+        current_operation_status = "Launching browser"
+        browser = playwright_instance.chromium.launch(
+            # Timeout here is for the launch process itself, not as granular
+            # timeout=playwright_op_timeout_ms / 2  # e.g., half of the operation timeout
+        )
+        current_operation_status = "Creating new context"
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            viewport={'width': 1280, 'height': 720},
+            java_script_enabled=True,
+            # Default timeouts will apply to all page operations
+        )
+        context.set_default_timeout(playwright_op_timeout_ms)
+        context.set_default_navigation_timeout(playwright_op_timeout_ms)
+
+        current_operation_status = "Creating new page"
+        page = context.new_page()
+        page_instance_created = True  # 'page' was successfully created
+
+        # Normalize URL for navigation
+        nav_url = url.strip()
+        if not nav_url.startswith(('http://', 'https://')):
+            nav_url = f'https://{nav_url}'
+
+        current_operation_status = f"Navigating to {nav_url}"
+        page.goto(nav_url, wait_until="domcontentloaded")  # Uses the default_navigation_timeout
+        page.wait_for_timeout(1000)  # Optional small additional wait
+
+        current_operation_status = "Capturing screenshot"
+        screenshot_path = os.path.join(subfolder_path, "screenshot.png")
+        page.screenshot(path=screenshot_path, full_page=True)  # Uses the default_timeout
+
+        current_operation_status = "Capturing HTML content"
+        html_content = page.content()  # Uses the default_timeout
+        with open(os.path.join(subfolder_path, "page.html"), "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        final_status = "Success"
+        with print_lock:
+            print(f"[{url_count+1}] ✅ Successfully processed {url}")
+
+    except PlaywrightTimeoutError as pte:  # Playwright-specific timeout
+        final_status = f"Playwright Timeout Error during: {current_operation_status}. Details: {str(pte)[:150]}"
+        with print_lock:
+            print(f"[{url_count+1}] ⏰ Playwright Timeout for {url} during {current_operation_status}: {str(pte)[:100]}...")
+        log_error_to_file(f"PlaywrightTimeoutError ({current_operation_status})", str(pte))
+    except PlaywrightError as pe:  # Other Playwright errors
+        final_status = f"Playwright Error during: {current_operation_status}. Details: {str(pe)[:150]}"
+        with print_lock:
+            print(f"[{url_count+1}] ❌ Playwright Error for {url} during {current_operation_status}: {str(pe)[:100]}...")
+        log_error_to_file(f"PlaywrightError ({current_operation_status})", str(pe))
+    except Exception as e:  # Other general errors (e.g., network, file, etc.)
+        final_status = f"General Error during: {current_operation_status}. Details: {str(e)[:150]}"
+        with print_lock:
+            print(f"[{url_count+1}] 💥 General Error for {url} during {current_operation_status}: {str(e)[:100]}...")
+        log_error_to_file(f"General Error ({current_operation_status})", str(e))
+    
+    # Update metadata.txt with the final status
+    try:
+        with open(metadata_filepath, "w", encoding="utf-8") as f:
+            f.write(f"Original URL: {url}\nProcessed URL: {processed_url_for_metadata}\nLabel: {label}\nStatus: {final_status}")
+    except Exception as meta_update_error:
+        with print_lock:
+            print(f"[{url_count+1}] ⚠️ Error updating metadata for {url}: {meta_update_error}")
+        log_error_to_file("Metadata Update Error", str(meta_update_error))
+
+    # 5. Playwright resource cleanup
+    finally:
+        try:
+            if page_instance_created and page:  # Only close if page was instantiated
+                try: page.close()
+                except Exception as page_close_err: log_error_to_file("Page Close Error", str(page_close_err))
+            if context:
+                try: context.close()
+                except Exception as context_close_err: log_error_to_file("Context Close Error", str(context_close_err))
+            if browser:
+                try: browser.close()
+                except Exception as browser_close_err: log_error_to_file("Browser Close Error", str(browser_close_err))
+        except Exception as cleanup_error:  # Error during close attempts
+            with print_lock:
+                print(f"[{url_count+1}] ⚠️ Error during Playwright resource cleanup for {url}: {str(cleanup_error)[:100]}...")
+            log_error_to_file("Playwright Resource Cleanup Error", str(cleanup_error))
+        finally:  # Ensure playwright_instance.stop() is always attempted
+            if playwright_instance:
+                try:
+                    playwright_instance.stop()
+                except Exception as stop_error:
+                    with print_lock:
+                        print(f"[{url_count+1}] 💥 CRITICAL: Error stopping Playwright instance for {url}: {str(stop_error)[:100]}...")
+                    log_error_to_file("Playwright Instance Stop Error (CRITICAL)", str(stop_error))
+
+
+def select_file():
+    """Displays a dialog to select a text file with URLs."""
+    root = tk.Tk()
+    root.withdraw()  # Hide main Tkinter window
+    file_path = filedialog.askopenfilename(
+        title="Select the URLs file (format: URL,label)",
+        initialdir=".",
+        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+    )
+    root.destroy()
+    return file_path
+
+
+def main():
+    file_to_process = DEFAULT_TXT_FILE
+    if not os.path.exists(DEFAULT_TXT_FILE):
+        print(f"Default file '{DEFAULT_TXT_FILE}' was not found.")
+        selected_file = select_file()
+        if not selected_file:
+            print("No file was selected. Exiting...")
+            return
+        file_to_process = selected_file
+    print(f"Using URLs file: {file_to_process}")
+
+    tasks = []
+    try:
+        with open(file_to_process, mode="r", encoding="utf-8") as file:
+            for line_num, line in enumerate(file):
+                line = line.strip()
+                if not line or line.startswith('#'):  # Ignore empty lines or comments
+                    continue
+                parts = line.split(",", 1)
+                if len(parts) >= 2:
+                    url, label = parts[0].strip(), parts[1].strip()
+                    if url:
+                        tasks.append((url, label, line_num))  # line_num for traceability and numbering
+                    else:
+                        with print_lock:
+                            print(f"Skipping line {line_num+1}: Empty URL.")
+                else:
+                    with print_lock:
+                        print(f"Skipping line {line_num+1}: Incorrect format (expected URL,Label).")
+    except FileNotFoundError:
+        print(f"Error: The file '{file_to_process}' was not found.")
+        return
+    except Exception as e:
+        print(f"Error reading the file '{file_to_process}': {e}")
+        return
+
+    if not tasks:
+        print("No valid URLs found to process in the file.")
+        return
+
+    print(f"\nTotal URLs to process: {len(tasks)}")
+    print(f"Output directory: {os.path.abspath(output_dir)}")
+    print(f"Global timeout per URL: {GLOBAL_PROCESS_TIMEOUT_PER_URL} seconds.")
+    print(f"Playwright operation timeout: {PLAYWRIGHT_OPERATION_TIMEOUT_MS / 1000} seconds.")
+    print("Processing URLs...\n")
+
+    # Adjust number of threads (workers)
+    max_workers = min(os.cpu_count() or 1, len(tasks), 4)  # Limit to 4 to avoid overwhelming the system
+    print(f"Using {max_workers} worker threads.")
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for task_args in tasks:  # task_args is (url, label, url_count)
+            futures.append(executor.submit(extract_page_data, task_args, PLAYWRIGHT_OPERATION_TIMEOUT_MS))
+
+        for i, future in enumerate(futures):
+            # Retrieve original task data for logging in case of an error here
+            original_url, _, original_url_count = tasks[i]
+            folder_name = f"{original_url_count+1:05d}_{sanitize_folder_name(original_url)}"
+            subfolder_path = os.path.join(output_dir, folder_name)  # To write error.log if the future fails
+            error_log_filepath_main = os.path.join(subfolder_path, "error.log")
+
+            try:
+                future.result(timeout=GLOBAL_PROCESS_TIMEOUT_PER_URL)
+            except FuturesTimeoutError:  # Timeout of the future.result()
+                with print_lock:
+                    print(f"[{original_url_count+1}] ⏰ GLOBAL TIMEOUT ({GLOBAL_PROCESS_TIMEOUT_PER_URL}s) for {original_url}. The thread was canceled or took too long.")
+                # Ensure the folder exists (although extract_page_data should have created it)
+                os.makedirs(subfolder_path, exist_ok=True)
+                try:
+                    with open(error_log_filepath_main, "a", encoding="utf-8") as f:
+                        f.write(f"\n--- GLOBAL TIMEOUT (Future) ---\nURL: {original_url}\n"
+                                f"The task exceeded {GLOBAL_PROCESS_TIMEOUT_PER_URL} seconds and was interrupted by the thread manager.\n")
+                    # Update metadata if possible
+                    with open(os.path.join(subfolder_path, "metadata.txt"), "w", encoding="utf-8") as f_meta:
+                        f_meta.write(f"Original URL: {original_url}\nProcessed URL: {original_url}\nLabel: {tasks[i][1]}\nStatus: Error - GLOBAL TIMEOUT ({GLOBAL_PROCESS_TIMEOUT_PER_URL}s)")
+                except Exception as e_log:
+                    with print_lock:
+                        print(f"[{original_url_count+1}] ⚠️ Error writing GLOBAL TIMEOUT log for {original_url}: {e_log}")
+            except Exception as e:  # Another error during future execution
+                with print_lock:
+                    print(f"[{original_url_count+1}] 💥 Error processing future for {original_url}: {str(e)[:100]}...")
+                os.makedirs(subfolder_path, exist_ok=True)
+                try:
+                    with open(error_log_filepath_main, "a", encoding="utf-8") as f:
+                        f.write(f"\n--- ERROR IN FUTURE (Executor) ---\nURL: {original_url}\nError: {str(e)}\n")
+                    with open(os.path.join(subfolder_path, "metadata.txt"), "w", encoding="utf-8") as f_meta:
+                        f_meta.write(f"Original URL: {original_url}\nProcessed URL: {original_url}\nLabel: {tasks[i][1]}\nStatus: Error - FUTURE: {str(e)[:100]}")
+                except Exception as e_log:
+                    with print_lock:
+                        print(f"[{original_url_count+1}] ⚠️ Error writing ERROR IN FUTURE log for {original_url}: {e_log}")
+
+    print("\n--- Process completed ---")
+    print(f"The results are located in: {os.path.abspath(output_dir)}")
+
+if __name__ == "__main__":
+    main()
