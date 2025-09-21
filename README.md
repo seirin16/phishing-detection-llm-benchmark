@@ -10,8 +10,11 @@ To use the notebooks, you must **download the file** from this repository and th
 
 Before running the notebooks, you need to download the dataset and place it in your Google Drive.
 
-1.  **Download the Dataset**: Get the dataset from the following Hugging Face repository: [https://huggingface.co/datasets/seirin16/Dataset_Phising](https://huggingface.co/datasets/seirin16/Dataset_Phising)
+To run the notebooks, please follow these steps:
+
+1.  **Download the Dataset**: The required dataset is hosted on Hugging Face. You can download it from the following link: [https://huggingface.co/datasets/seirin16/Dataset_Phising](https://huggingface.co/datasets/seirin16/Dataset_Phising).
 2.  **Upload to Google Drive**: Once downloaded, upload the dataset to your Google Drive. The notebooks are configured to access the data from there.
+3.  **Run the Notebooks**: Download the desired notebook (.ipynb file) from this repository and upload it to your Google Drive to open it with Google Colab.
 
 ---
 
